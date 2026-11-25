@@ -85,7 +85,7 @@ func main() {
 		d.ui = tea.NewProgram(newModel(d), opts...)
 		go func() {
 			errc <- d.run(ctx)
-			d.ui.Send(doneMsg{})
+			d.stopUI()
 		}()
 		_, uiErr = d.ui.Run()
 		d.uiDone.Store(true)
@@ -93,11 +93,14 @@ func main() {
 			cancel()
 		}
 	}
-	interrupted := ctx.Err() != nil
-	if s := d.sess(); s != nil {
-		s.stop() // unblocks run if it is mid-call
-	}
+	go func() {
+		<-ctx.Done()
+		if s := d.sess(); s != nil {
+			s.stop() // unblocks run if it is mid-call
+		}
+	}()
 	runErr := <-errc
+	interrupted := ctx.Err() != nil
 	if !d.finished.Load() {
 		if interrupted {
 			d.print("\n" + red.Render("interrupted"))
@@ -162,6 +165,7 @@ func (d *demo) run(ctx context.Context) error {
 	d.setBoard(true)
 	d.watch(ctx)
 	d.setBoard(false)
+	d.stopUI()
 	d.print(renderBoard(d.snapshot(), "", 0, !d.plain))
 	if ctx.Err() != nil {
 		return nil
@@ -177,7 +181,7 @@ func (d *demo) run(ctx context.Context) error {
 		}
 		icon, style := statusIcon(r.status)
 		text := lipgloss.NewStyle()
-		if res.IsError {
+		if r.status == mcp.StatusFailed {
 			text = red
 		}
 		var b strings.Builder
@@ -286,6 +290,18 @@ type demo struct {
 	board    bool   // the live board is showing
 	activity string // what the demo is doing when there is no board
 	answered bool
+}
+
+// stopUI ends the live UI once the board is done, so the rest prints
+// straight to the terminal. (Lines printed above a view that shrinks can get
+// erased.)
+func (d *demo) stopUI() {
+	if d.ui == nil || d.uiDone.Load() {
+		return
+	}
+	d.ui.Send(doneMsg{})
+	d.ui.Wait()
+	d.uiDone.Store(true)
 }
 
 // print writes s above the live UI, where it stays.

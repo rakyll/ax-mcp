@@ -68,7 +68,7 @@ type model struct {
 }
 
 func newModel(d *demo) model {
-	return model{d: d, width: 100, spin: spinner.New(spinner.WithSpinner(spinner.Dot), spinner.WithStyle(yellow))}
+	return model{d: d, width: 100, spin: spinner.New(spinner.WithSpinner(spinner.MiniDot), spinner.WithStyle(yellow))}
 }
 
 func (m model) Init() tea.Cmd { return m.spin.Tick }
