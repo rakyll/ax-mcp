@@ -2,7 +2,8 @@
 // newline-delimited JSON, which is what the MCP stdio transport speaks.
 //
 // Both sides of an MCP session send requests: the client calls tools/call
-// and tasks/*, the server calls elicitation/create. A Conn handles incoming
+// and tasks/*, and a server talking to an older client calls
+// elicitation/create. A Conn handles incoming
 // requests with a Handler and lets the caller issue its own with Call.
 package jsonrpc
 
@@ -125,7 +126,19 @@ func (c *Conn) Run(ctx context.Context) error {
 	return err
 }
 
+type idKey struct{}
+
+// RequestID returns the ID of the request a handler is serving, or nil for a
+// notification.
+func RequestID(ctx context.Context) json.RawMessage {
+	id, _ := ctx.Value(idKey{}).(json.RawMessage)
+	return id
+}
+
 func (c *Conn) serve(ctx context.Context, m *message) {
+	if m.ID != nil {
+		ctx = context.WithValue(ctx, idKey{}, m.ID)
+	}
 	res, err := c.handler(ctx, m.Method, m.Params)
 	if m.ID == nil {
 		return // notification

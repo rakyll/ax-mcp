@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -43,9 +44,10 @@ func statusIcon(status string) (string, lipgloss.Style) {
 // doneMsg tells the UI the tour is over.
 type doneMsg struct{}
 
-// elicitMsg asks the UI to put an elicitation/create request to the user.
+// elicitMsg asks the UI to put a task's elicitation input request to the user.
 type elicitMsg struct {
 	taskID, job string
+	key         string // the inputRequests key
 	params      mcp.ElicitParams
 	reply       chan mcp.ElicitResult
 }
@@ -221,19 +223,19 @@ func (m model) View() tea.View {
 // the spinner frame for working tasks; width 0 means don't truncate.
 func renderBoard(s snapshot, spin string, width int, events bool) string {
 	var b strings.Builder
-	b.WriteString(faint.Render(fmt.Sprintf("  %-14s %-9s %-16s %s", "TASK", "JOB", "STATUS", "STATUS MESSAGE")) + "\n")
+	b.WriteString(faint.Render(fmt.Sprintf("  %-20s %-9s %-16s %s", "TASK", "JOB", "STATUS", "STATUS MESSAGE")) + "\n")
 	for _, r := range s.rows {
 		icon, style := statusIcon(r.status)
 		if r.status == mcp.StatusWorking && spin != "" {
 			icon = spin
 		}
-		msg := r.message
+		msg, _, _ := strings.Cut(r.message, "\n")
 		if width > 0 {
-			msg = ansi.Truncate(msg, max(10, width-45), "…")
+			msg = ansi.Truncate(msg, max(10, width-51), "…")
 		}
-		fmt.Fprintf(&b, "  %s %-9s %s %s %s\n", cyan.Render(fmt.Sprintf("%-14s", r.id)), r.job, icon, style.Render(fmt.Sprintf("%-14s", r.status)), msg)
+		fmt.Fprintf(&b, "  %s %-9s %s %s %s\n", cyan.Render(fmt.Sprintf("%-20s", r.id)), r.job, icon, style.Render(fmt.Sprintf("%-14s", r.status)), msg)
 	}
-	b.WriteString("\n" + faint.Render(fmt.Sprintf("  notifications/tasks/status: %d   tasks/get: %d   server restarts: %d", s.notifs, s.polls, s.restarts)) + "\n")
+	b.WriteString("\n" + faint.Render(fmt.Sprintf("  notifications/tasks: %d   tasks/get: %d   server restarts: %d", s.notifs, s.polls, s.restarts)) + "\n")
 	if events {
 		for _, e := range s.events {
 			b.WriteString("  " + e + "\n")
@@ -315,7 +317,7 @@ func (f *form) autoChoice() int {
 func (f *form) view(width int) string {
 	w := min(max(width-4, 40), 96)
 	var b strings.Builder
-	b.WriteString(purple.Bold(true).Render("elicitation/create") + " " + faint.Render("related-task "+f.taskID+" · job "+f.job) + "\n")
+	b.WriteString(purple.Bold(true).Render("elicitation/create") + " " + faint.Render("inputRequests["+strconv.Quote(f.key)+"] · task "+f.taskID+" · job "+f.job) + "\n")
 	b.WriteString(bold.Width(w-4).Render(f.params.Message) + "\n\n")
 	titleW := 0
 	for _, fl := range f.fields {

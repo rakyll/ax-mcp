@@ -1,7 +1,7 @@
 // Command ax-mcp is an MCP server (stdio) whose tool calls run as MCP tasks
-// backed by AX tasks: every task-augmented tools/call becomes a sandboxed AX
-// task, and tasks/get, tasks/result, tasks/list and tasks/cancel read from and
-// act on it.
+// (the io.modelcontextprotocol/tasks extension) backed by AX tasks: every
+// tools/call becomes a sandboxed AX task, and tasks/get, tasks/update,
+// tasks/cancel and notifications/tasks read from and act on it.
 //
 // ax-mcp keeps no state of its own. The AX task (its labels, its actor's
 // state, and a few files in its workspace) is the MCP task, so ax-mcp can be
@@ -11,13 +11,14 @@ package main
 import (
 	"context"
 	"crypto/rand"
-	"encoding/hex"
+	"encoding/base32"
 	"flag"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/google/ax/client"
@@ -70,8 +71,10 @@ func fatal(format string, args ...any) {
 	os.Exit(1)
 }
 
+// newTaskID returns an unguessable task ID: the spec lets anyone holding one
+// read the task, and there is no tasks/list to scope.
 func newTaskID() string {
-	b := make([]byte, 4)
+	b := make([]byte, 10)
 	rand.Read(b)
-	return "mcp-" + hex.EncodeToString(b)
+	return "mcp-" + strings.ToLower(base32.StdEncoding.EncodeToString(b))
 }

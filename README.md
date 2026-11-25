@@ -1,22 +1,23 @@
 # ax-mcp: AX tasks over MCP
 
-`ax-mcp` is an MCP server whose tool calls run as
-[MCP tasks](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/tasks),
-and every MCP task is an AX task.
+`ax-mcp` is an MCP server whose tool calls run as tasks from the
+[MCP Tasks extension](https://modelcontextprotocol.io/extensions/tasks/overview)
+(`io.modelcontextprotocol/tasks`), and every MCP task is an AX task.
 
 ![demo](docs/demo.gif)
 
 | MCP | AX |
 |---|---|
-| task-augmented `tools/call` | `CreateTask` + `ResumeTask` |
-| `tasks/get`, `notifications/tasks/status` | the task's state and what the job reports |
-| `input_required` + `elicitation/create` | the job asks the user a question and waits |
-| `tasks/result` | the job's output once it exits |
-| `tasks/cancel` | SIGTERM to the job; what it writes on the way out is the result |
-| `tasks/list` | `ListTasks` |
+| `tools/call` → `CreateTaskResult` | `CreateTask` + `ResumeTask` |
+| `tasks/get`, `notifications/tasks` | the task's state and what the job reports; the job's output once it exits |
+| `input_required` + `inputRequests`, answered with `tasks/update` | the job asks the user a question and waits |
+| `tasks/cancel` | SIGTERM to the job; what it writes on the way out becomes the status message |
 
 ax-mcp keeps no state: everything lives in AX, so you can kill ax-mcp
-mid-flight and a new one picks up every task.
+mid-flight and a new one answers `tasks/get` for every task.
+
+Clients that don't declare the extension get a plain `tools/call` that
+returns when the job is done.
 
 ## Run the demo
 
@@ -36,7 +37,8 @@ five jobs as MCP tasks:
 - **tune** runs a grid search that would take over an hour, so the agent cancels it
 - **etl** loads September's payments and quarantines two bad rows
 
-Along the way the demo kills ax-mcp and recovers every task with `tasks/list`.
+Along the way the demo kills ax-mcp, starts a new one, and carries on with the
+task IDs it kept.
 At the end it deletes the AX tasks (`-keep` leaves them).
 
 ## Use it from an MCP client
@@ -54,7 +56,7 @@ the MCP client through the `axmcp` module, which ax-mcp provides:
 | Call | MCP effect |
 |---|---|
 | `axmcp.status(message)` | sets the task's `statusMessage` |
-| `axmcp.ask(message, schema)` | moves the task to `input_required` and asks the user through `elicitation/create`; blocks until they answer |
+| `axmcp.ask(message, schema)` | moves the task to `input_required` with an `elicitation/create` input request; blocks until the client answers with `tasks/update` |
 | `axmcp.result(text)` | sets the text of the tool result |
 
 ```python
@@ -81,6 +83,6 @@ axmcp.result("loaded 997 rows")
 or `cancel`, and `content` holds the answers when it is `accept`.
 
 If a job never calls `axmcp.result`, its stdout becomes the result. A non-zero
-exit makes the result an error. On `tasks/cancel` the job gets SIGTERM, then
-SIGKILL 5 seconds later. A job can catch SIGTERM and call `axmcp.result` to
-return partial work.
+exit makes the result an error (`isError`). On `tasks/cancel` the job gets
+SIGTERM, then SIGKILL 5 seconds later. A job can catch SIGTERM and call
+`axmcp.result` to report partial work in the cancelled task's status message.

@@ -1,7 +1,8 @@
-// Command ax-mcp-demo is an MCP client that tours the MCP tasks protocol
-// against ax-mcp: it fans out sandboxed jobs as tasks, answers a question one
-// of them asks from inside its sandbox, cancels a runaway job, kills ax-mcp
-// mid-flight and recovers every task from AX, and collects the results.
+// Command ax-mcp-demo is an MCP client that tours the MCP Tasks extension
+// (io.modelcontextprotocol/tasks) against ax-mcp: it fans out sandboxed jobs
+// as tasks, answers a question one of them asks from inside its sandbox,
+// cancels a runaway job, kills ax-mcp mid-flight and carries on with a new
+// one, and collects the results.
 //
 // The tour runs in its own goroutine and drives a Bubble Tea UI (ui.go):
 // finished steps print above a live board of tasks.
@@ -62,7 +63,7 @@ func main() {
 	if !inTTY {
 		*auto = true
 	}
-	d := &demo{start: time.Now(), byID: map[string]*row{}, plain: !outTTY}
+	d := &demo{start: time.Now(), byID: map[string]*row{}, plain: !outTTY, pollEvery: time.Second}
 	if err := d.openLogs(); err != nil {
 		fmt.Fprintf(os.Stderr, "ax-mcp-demo: %v\n", err)
 		os.Exit(1)
@@ -72,7 +73,7 @@ func main() {
 	// otherwise SIGINT does.
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	d.cancel = cancel
+	d.cancel, d.ctx = cancel, ctx
 	errc := make(chan error, 1)
 	var uiErr error
 	if d.plain { // no terminal to draw on: just print
@@ -122,47 +123,53 @@ func (d *demo) run(ctx context.Context) error {
 		faint.Render("  Every tool call below runs as an MCP task backed by an AX task.") + "\n" +
 		faint.Render("  server log: "+d.logPath))
 
-	d.print(step("1", "initialize", "the server advertises the tasks capability"))
+	d.print(step("1", "server/discover", "the server advertises the tasks extension"))
 	d.setActivity("starting ax-mcp")
-	init, err := d.connect(ctx)
+	disc, err := d.connect(ctx)
 	if err != nil {
 		return err
 	}
-	tasksCap, _ := json.Marshal(init.Capabilities["tasks"])
-	d.print(frame("←", "protocolVersion %s, capabilities.tasks = %s", init.ProtocolVersion, tasksCap))
+	exts, _ := json.Marshal(disc.Capabilities["extensions"])
+	d.print(frame("←", "supportedVersions %v, capabilities.extensions = %s", disc.SupportedVersions, exts))
 
-	d.print(step("2", "tools/list", "tools say whether they can run as tasks"))
+	d.print(step("2", "tools/list", "capabilities are per request: every request declares the tasks extension"))
+	d.print(frame("→", `_meta["%s"] = %s`, mcp.MetaClientCapabilities, mustJSON(clientCaps)))
 	var tools mcp.ListToolsResult
-	if err := d.sess().conn.Call(ctx, "tools/list", struct{}{}, &tools); err != nil {
+	if err := d.sess().call(ctx, "tools/list", nil, &tools); err != nil {
 		return err
 	}
 	for _, t := range tools.Tools {
-		d.print(frame("←", "%s  execution.taskSupport = %q", bold.Render(t.Name), t.Execution.TaskSupport))
+		d.print(frame("←", "%s  %q", bold.Render(t.Name), t.Title))
 	}
 
-	d.print(step("3", "tools/call × 5, task-augmented", "each call returns a CreateTaskResult right away; the work runs in AX"))
+	d.print(step("3", "tools/call × 5", "the server decides to answer each with a task; the work runs in AX"))
 	d.setActivity("creating tasks")
 	for _, j := range jobs {
 		code, _ := jobFiles.ReadFile(j.file)
-		ttl := int64(10 * time.Minute / time.Millisecond)
 		params := map[string]any{
 			"name":      "sandbox_run",
 			"arguments": map[string]any{"code": string(code), "language": j.lang, "name": j.name},
-			"task":      mcp.TaskParams{TTL: &ttl},
 		}
 		t0 := time.Now()
-		var res mcp.CreateTaskResult
-		if err := d.sess().conn.Call(ctx, "tools/call", params, &res); err != nil {
+		var res mcp.ToolCallResult
+		if err := d.sess().call(ctx, "tools/call", params, &res); err != nil {
 			return fmt.Errorf("tools/call %s: %w", j.name, err)
 		}
-		d.print(frame("→", "tools/call sandbox_run {name: %-12s task: {ttl: %d}}", strconv.Quote(j.name)+",", ttl) + "\n" +
-			frame("←", "task %s %s %s", cyan.Render(res.Task.TaskID), res.Task.Status, faint.Render("("+time.Since(t0).Round(time.Millisecond).String()+")")))
-		d.add(&row{id: res.Task.TaskID, job: j.name, status: res.Task.Status, message: res.Task.StatusMessage})
+		if res.ResultType != mcp.ResultTask {
+			return fmt.Errorf("tools/call %s: got resultType %q, not a task", j.name, res.ResultType)
+		}
+		d.print(frame("→", "tools/call sandbox_run {name: %s}", strconv.Quote(j.name)) + "\n" +
+			frame("←", "resultType %q  %s %s %s", res.ResultType, cyan.Render(res.TaskID), res.Status, faint.Render("("+time.Since(t0).Round(time.Millisecond).String()+")")))
+		d.add(&row{id: res.TaskID, job: j.name, status: res.Status, message: res.StatusMessage, asked: map[string]bool{}})
+		if res.PollIntervalMs > 0 {
+			d.pollEvery = time.Duration(res.PollIntervalMs) * time.Millisecond
+		}
 	}
 
-	d.print(step("4", "watch", "notifications/tasks/status and tasks/get polling drive the board"))
+	d.print(step("4", "watch", "notifications/tasks from subscriptions/listen, and tasks/get every pollIntervalMs"))
 	d.setActivity("")
 	d.setBoard(true)
+	d.listen(ctx)
 	d.watch(ctx)
 	d.setBoard(false)
 	d.stopUI()
@@ -171,21 +178,24 @@ func (d *demo) run(ctx context.Context) error {
 		return nil
 	}
 
-	d.print(step("5", "tasks/result", "the tool results, each tagged with io.modelcontextprotocol/related-task"))
-	d.setActivity("collecting results")
+	d.print(step("5", "results", "a finished task's tasks/get carries its tool result inline"))
 	for _, r := range d.rows {
-		var res mcp.CallToolResult
-		if err := d.sess().conn.Call(ctx, "tasks/result", mcp.TaskIDParams{TaskID: r.id}, &res); err != nil {
-			d.print(fmt.Sprintf("  %s %v", bold.Render(fmt.Sprintf("%-10s", r.job)), err))
-			continue
-		}
 		icon, style := statusIcon(r.status)
 		text := lipgloss.NewStyle()
-		if r.status == mcp.StatusFailed {
-			text = red
+		var lines []string
+		switch {
+		case r.result != nil:
+			lines = resultLines(r.result.Content, 5)
+			if r.result.IsError {
+				text = red
+			}
+		case r.err != nil:
+			lines, text = []string{fmt.Sprintf("error %d: %s", r.err.Code, r.err.Message)}, red
+		default: // cancelled: no result, just a status message
+			lines = resultLines([]mcp.Content{{Text: r.message}}, 5)
 		}
 		var b strings.Builder
-		for i, line := range resultLines(res, 5) {
+		for i, line := range lines {
 			if i == 0 {
 				fmt.Fprintf(&b, "  %s %s", style.Render(icon), bold.Render(fmt.Sprintf("%-10s", r.job)))
 			} else {
@@ -238,9 +248,9 @@ func frame(dir, format string, args ...any) string {
 	return "  " + style.Render(dir) + " " + fmt.Sprintf(format, args...)
 }
 
-func resultLines(res mcp.CallToolResult, max int) []string {
+func resultLines(content []mcp.Content, max int) []string {
 	var text strings.Builder
-	for _, c := range res.Content {
+	for _, c := range content {
 		text.WriteString(c.Text)
 	}
 	lines := strings.Split(strings.TrimSpace(text.String()), "\n")
@@ -256,6 +266,31 @@ type session struct {
 	conn *jsonrpc.Conn
 }
 
+// clientCaps is what the demo declares on every request: it takes tasks, and
+// answers the elicitations they carry in inputRequests.
+var clientCaps = map[string]any{
+	"elicitation": map[string]any{"form": map[string]any{}},
+	"extensions":  map[string]any{mcp.ExtTasks: map[string]any{}},
+}
+
+// call sends a request with the per-request _meta of 2026-07-28.
+func (s *session) call(ctx context.Context, method string, params map[string]any, out any) error {
+	p := map[string]any{"_meta": map[string]any{
+		mcp.MetaProtocolVersion:    mcp.ProtocolVersion,
+		mcp.MetaClientInfo:         mcp.Implementation{Name: "ax-mcp-demo", Version: "0.1.0"},
+		mcp.MetaClientCapabilities: clientCaps,
+	}}
+	for k, v := range params {
+		p[k] = v
+	}
+	return s.conn.Call(ctx, method, p, out)
+}
+
+func mustJSON(v any) string {
+	b, _ := json.Marshal(v)
+	return string(b)
+}
+
 func (s *session) stop() {
 	s.cmd.Process.Kill()
 	s.cmd.Wait()
@@ -263,7 +298,9 @@ func (s *session) stop() {
 
 type row struct {
 	id, job, status, message string
-	resultRunning            bool
+	result                   *mcp.CallToolResult // once completed
+	err                      *mcp.Error          // once failed
+	asked                    map[string]bool     // inputRequests keys already handled
 }
 
 type demo struct {
@@ -274,6 +311,7 @@ type demo struct {
 	ui      *tea.Program
 	plain   bool // stdout is not a terminal: print, don't draw
 	cancel  context.CancelFunc
+	ctx     context.Context
 
 	printMu  sync.Mutex
 	uiDone   atomic.Bool
@@ -288,8 +326,9 @@ type demo struct {
 	notifs   int
 	polls    int
 	board    bool   // the live board is showing
-	activity string // what the demo is doing when there is no board
-	answered bool
+	activity  string // what the demo is doing when there is no board
+	answered  bool
+	pollEvery time.Duration
 }
 
 // stopUI ends the live UI once the board is done, so the rest prints
@@ -392,8 +431,9 @@ func (d *demo) snapshot() snapshot {
 	return s
 }
 
-// connect starts ax-mcp and initializes a session with it.
-func (d *demo) connect(ctx context.Context) (*mcp.InitializeResult, error) {
+// connect starts ax-mcp and asks it what it supports. There is no session to
+// set up: every request carries its own protocol version and capabilities.
+func (d *demo) connect(ctx context.Context) (*mcp.DiscoverResult, error) {
 	path := *serverPath
 	if path == "" {
 		if exe, err := os.Executable(); err == nil {
@@ -429,28 +469,32 @@ func (d *demo) connect(ctx context.Context) (*mcp.InitializeResult, error) {
 	}
 	go s.conn.Run(ctx)
 
-	var res mcp.InitializeResult
-	err = s.conn.Call(ctx, "initialize", mcp.InitializeParams{
-		ProtocolVersion: mcp.ProtocolVersion,
-		Capabilities:    json.RawMessage(`{"elicitation":{"form":{}}}`),
-		ClientInfo:      mcp.Implementation{Name: "ax-mcp-demo", Version: "0.1.0"},
-	}, &res)
-	if err != nil {
+	var res mcp.DiscoverResult
+	if err := s.call(ctx, "server/discover", nil, &res); err != nil {
 		s.stop()
-		return nil, fmt.Errorf("initialize: %w (see %s)", err, d.logPath)
+		return nil, fmt.Errorf("server/discover: %w (see %s)", err, d.logPath)
 	}
-	s.conn.Notify("notifications/initialized", struct{}{})
 	d.mu.Lock()
 	d.cur = s
 	d.mu.Unlock()
 	return &res, nil
 }
 
-// handle serves what ax-mcp sends us: status notifications and elicitations.
+// handle serves what ax-mcp sends us: notifications on our subscription.
 func (d *demo) handle(ctx context.Context, method string, params json.RawMessage) (any, error) {
 	switch method {
-	case "notifications/tasks/status":
-		var t mcp.Task
+	case "notifications/subscriptions/acknowledged":
+		var ack mcp.ListenAck
+		if json.Unmarshal(params, &ack) == nil {
+			var names []string
+			for _, id := range ack.Notifications.TaskIDs {
+				names = append(names, d.jobName(id))
+			}
+			d.event("%s notifications/tasks for %d tasks: %s", purple.Render("← subscription acknowledged:"), len(names), strings.Join(names, ", "))
+		}
+		return nil, nil
+	case "notifications/tasks":
+		var t mcp.DetailedTask
 		if json.Unmarshal(params, &t) == nil {
 			d.mu.Lock()
 			d.notifs++
@@ -458,17 +502,13 @@ func (d *demo) handle(ctx context.Context, method string, params json.RawMessage
 			d.apply(t)
 		}
 		return nil, nil
-	case "elicitation/create":
-		var p mcp.ElicitParams
-		if err := json.Unmarshal(params, &p); err != nil {
-			return nil, jsonrpc.Errorf(jsonrpc.CodeInvalidParams, "%v", err)
-		}
-		return d.elicit(ctx, p)
 	}
 	return nil, jsonrpc.Errorf(jsonrpc.CodeMethodNotFound, "method %q not found", method)
 }
 
-func (d *demo) apply(t mcp.Task) {
+// apply records a task's state, from tasks/get or notifications/tasks, and
+// takes up any input request it hasn't seen.
+func (d *demo) apply(t mcp.DetailedTask) {
 	d.mu.Lock()
 	r, ok := d.byID[t.TaskID]
 	if !ok || mcp.Terminal(r.status) {
@@ -476,22 +516,53 @@ func (d *demo) apply(t mcp.Task) {
 		return
 	}
 	changed := r.status != t.Status
-	r.status, r.message = t.Status, t.StatusMessage
+	r.status, r.message, r.result, r.err = t.Status, t.StatusMessage, t.Result, t.Error
+	var keys []string
+	if t.Status == mcp.StatusInputRequired {
+		for key := range t.InputRequests {
+			if !r.asked[key] {
+				r.asked[key] = true
+				keys = append(keys, key)
+			}
+		}
+	}
 	d.mu.Unlock()
+	for _, key := range keys {
+		go d.fulfill(r, key, t.InputRequests[key])
+	}
 	if changed && mcp.Terminal(t.Status) {
 		icon, style := statusIcon(t.Status)
 		d.event("%s %s", style.Render(icon+" "+r.job), t.Status)
 	}
 }
 
+// fulfill answers one of a task's inputRequests with tasks/update.
+func (d *demo) fulfill(r *row, key string, req mcp.InputRequest) {
+	ctx := d.ctx
+	if req.Method != "elicitation/create" {
+		d.event(red.Render("%s asked for %s, which this demo can't answer"), r.job, req.Method)
+		return
+	}
+	d.event("%s %s is input_required: inputRequests[%q] is an elicitation", purple.Render("?"), r.job, key)
+	res, err := d.elicit(ctx, r, key, req.Params)
+	if err != nil {
+		return
+	}
+	err = d.sess().call(ctx, "tasks/update", map[string]any{"taskId": r.id, "inputResponses": map[string]any{key: res}}, nil)
+	if err != nil {
+		d.event(red.Render("tasks/update %s: %v"), r.job, err)
+		return
+	}
+	d.event("%s %s: the answer was written into its sandbox", green.Render("→ tasks/update"), r.job)
+	d.mu.Lock()
+	d.answered = true
+	d.mu.Unlock()
+}
+
 // elicit asks the user, through the UI's form, the question a job asked from
 // inside its sandbox, and prints the exchange once it is answered.
-func (d *demo) elicit(ctx context.Context, p mcp.ElicitParams) (mcp.ElicitResult, error) {
-	taskID := ""
-	if rt, ok := p.Meta[mcp.MetaRelatedTask].(map[string]any); ok {
-		taskID, _ = rt["taskId"].(string)
-	}
-	req := elicitMsg{taskID: taskID, job: d.jobName(taskID), params: p, reply: make(chan mcp.ElicitResult, 1)}
+func (d *demo) elicit(ctx context.Context, r *row, key string, p mcp.ElicitParams) (mcp.ElicitResult, error) {
+	req := elicitMsg{taskID: r.id, job: r.job, key: key, params: p, reply: make(chan mcp.ElicitResult, 1)}
 	var res mcp.ElicitResult
 	if d.plain {
 		res = mcp.ElicitResult{Action: "accept", Content: autoContent(req)}
@@ -507,7 +578,7 @@ func (d *demo) elicit(ctx context.Context, p mcp.ElicitParams) (mcp.ElicitResult
 	bar := purple.Render("│")
 	lines := []string{
 		"",
-		"  " + purple.Bold(true).Render("┌ elicitation/create") + " " + faint.Render("(related-task "+taskID+", job "+req.job+")"),
+		"  " + purple.Bold(true).Render("┌ inputRequests["+strconv.Quote(key)+"]: elicitation/create") + " " + faint.Render("(task "+r.id+", job "+r.job+")"),
 		"  " + bar + " " + bold.Render(p.Message),
 	}
 	props, _ := p.RequestedSchema["properties"].(map[string]any)
@@ -524,13 +595,8 @@ func (d *demo) elicit(ctx context.Context, p mcp.ElicitParams) (mcp.ElicitResult
 		}
 		lines = append(lines, "  "+bar+" "+title+": "+answer)
 	}
-	lines = append(lines, "  "+purple.Render("└ "+res.Action), "")
+	lines = append(lines, "  "+purple.Render("└ "+res.Action+" → tasks/update"), "")
 	d.print(strings.Join(lines, "\n"))
-	d.event("%s elicitation answered for %s; the answer was written into its sandbox", purple.Render("?"), req.job)
-
-	d.mu.Lock()
-	d.answered = true
-	d.mu.Unlock()
 	return res, nil
 }
 
@@ -560,7 +626,7 @@ func fieldOrder(schema map[string]any) []string {
 // watch polls the tasks until every one is terminal, and runs the scripted
 // moments of the demo: cancel, input_required, and the server restart.
 func (d *demo) watch(ctx context.Context) {
-	poll := time.NewTicker(time.Second)
+	poll := time.NewTicker(d.pollEvery)
 	defer poll.Stop()
 	cancelled, restarted := false, *noRestart
 	watchStart := time.Now()
@@ -582,10 +648,6 @@ func (d *demo) watch(ctx context.Context) {
 			if !mcp.Terminal(r.status) {
 				allDone = false
 			}
-			if r.status == mcp.StatusInputRequired && !r.resultRunning {
-				r.resultRunning = true
-				go d.awaitInput(ctx, r)
-			}
 		}
 		answered := d.answered
 		var tuneID, tuneMsg string
@@ -606,11 +668,10 @@ func (d *demo) watch(ctx context.Context) {
 			cancelled = true
 			eta := "an ETA of " + tuneMsg[strings.LastIndex(tuneMsg, "ETA")+4:]
 			d.event("%s tune: the grid search reports %s, too long", green.Render("→ tasks/cancel"), eta)
-			var t mcp.Task
-			if err := d.sess().conn.Call(ctx, "tasks/cancel", mcp.TaskIDParams{TaskID: tuneID}, &t); err != nil {
+			if err := d.sess().call(ctx, "tasks/cancel", map[string]any{"taskId": tuneID}, nil); err != nil {
 				d.event(red.Render("tasks/cancel %s failed: %v"), tuneID, err)
 			} else {
-				d.apply(t)
+				d.event("%s cancellation is cooperative: the job gets SIGTERM", purple.Render("← acked;"))
 			}
 		}
 		if !restarted && cancelled && (answered || age > 40*time.Second) {
@@ -621,22 +682,14 @@ func (d *demo) watch(ctx context.Context) {
 }
 
 func (d *demo) pollAll(ctx context.Context) {
-	d.mu.Lock()
-	var ids []string
-	for _, r := range d.rows {
-		if !mcp.Terminal(r.status) {
-			ids = append(ids, r.id)
-		}
-	}
-	d.mu.Unlock()
 	s := d.sess()
 	var wg sync.WaitGroup
-	for _, id := range ids {
+	for _, id := range d.pending() {
 		wg.Go(func() {
 			cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
-			var t mcp.Task
-			if s.conn.Call(cctx, "tasks/get", mcp.TaskIDParams{TaskID: id}, &t) == nil {
+			var t mcp.DetailedTask
+			if s.call(cctx, "tasks/get", map[string]any{"taskId": id}, &t) == nil {
 				d.mu.Lock()
 				d.polls++
 				d.mu.Unlock()
@@ -647,19 +700,29 @@ func (d *demo) pollAll(ctx context.Context) {
 	wg.Wait()
 }
 
-// awaitInput calls tasks/result for a task that needs input. That is the
-// channel ax-mcp uses to send the task's elicitation/create request.
-func (d *demo) awaitInput(ctx context.Context, r *row) {
-	d.event("%s %s is input_required %s, so the server can ask", purple.Render("?"), r.job, green.Render("→ tasks/result"))
-	var res mcp.CallToolResult
-	d.sess().conn.Call(ctx, "tasks/result", mcp.TaskIDParams{TaskID: r.id}, &res)
+// pending is the IDs of the tasks that are not done yet.
+func (d *demo) pending() []string {
 	d.mu.Lock()
-	r.resultRunning = false
-	d.mu.Unlock()
+	defer d.mu.Unlock()
+	var ids []string
+	for _, r := range d.rows {
+		if !mcp.Terminal(r.status) {
+			ids = append(ids, r.id)
+		}
+	}
+	return ids
 }
 
-// restart kills ax-mcp and starts a new one, which knows nothing: tasks/list
-// rebuilds every task from AX.
+// listen opens a subscriptions/listen for the pending tasks. It stays open
+// until the server goes away.
+func (d *demo) listen(ctx context.Context) {
+	s, ids := d.sess(), d.pending()
+	d.event("%s taskIds of %d tasks", green.Render("→ subscriptions/listen"), len(ids))
+	go s.call(ctx, "subscriptions/listen", map[string]any{"notifications": map[string]any{"taskIds": ids}}, nil)
+}
+
+// restart kills ax-mcp and starts a new one, which knows nothing. The demo
+// kept the task IDs, and the new server finds every task in AX.
 func (d *demo) restart(ctx context.Context) {
 	old := d.sess()
 	d.event("%s, with %d tasks in flight", red.Render(fmt.Sprintf("✝ SIGKILL ax-mcp (pid %d)", old.cmd.Process.Pid)), d.inFlight())
@@ -671,18 +734,8 @@ func (d *demo) restart(ctx context.Context) {
 	d.mu.Lock()
 	d.restarts++
 	d.mu.Unlock()
-	var list mcp.ListTasksResult
-	if err := d.sess().conn.Call(ctx, "tasks/list", struct{}{}, &list); err != nil {
-		d.event(red.Render("tasks/list: %v"), err)
-		return
-	}
-	var names []string
-	for _, t := range list.Tasks {
-		d.apply(t)
-		names = append(names, d.jobName(t.TaskID))
-	}
-	d.event("%s %s recovered %d tasks from AX: %s", green.Render(fmt.Sprintf("↻ new ax-mcp (pid %d)", d.sess().cmd.Process.Pid)),
-		green.Render("→ tasks/list"), len(list.Tasks), strings.Join(names, ", "))
+	d.event("%s starts empty; the task IDs the demo kept still work", green.Render(fmt.Sprintf("↻ new ax-mcp (pid %d)", d.sess().cmd.Process.Pid)))
+	d.listen(ctx)
 }
 
 func (d *demo) inFlight() int {

@@ -219,7 +219,9 @@ func (b *backend) exec(ctx context.Context, id string, stdin []byte, argv ...str
 type probe struct {
 	Status    *string `json:"status"`
 	Ask       *string `json:"ask"`
+	Answered  *int    `json:"answered"`
 	Exit      *string `json:"exit"`
+	CancelReq bool    `json:"cancelRequested"`
 	Cancelled bool    `json:"cancelled"`
 	Output    *string `json:"output"`
 	Stdout    *string `json:"stdout"`

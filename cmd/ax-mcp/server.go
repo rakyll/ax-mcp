@@ -1,11 +1,11 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,9 +21,7 @@ import (
 
 const (
 	pollInterval = time.Second
-	defaultTTL   = 10 * time.Minute
-	minTTL       = 30 * time.Second
-	maxTTL       = time.Hour
+	taskTTL      = 10 * time.Minute
 )
 
 var sandboxRunTool = mcp.Tool{
@@ -40,16 +38,22 @@ var sandboxRunTool = mcp.Tool{
 		},
 		"required": []string{"code"},
 	},
-	Execution: &mcp.ToolExecution{TaskSupport: "optional"},
 }
 
+const instructions = "sandbox_run runs code as an AX task, in an isolated sandbox. " +
+	"Clients with the io.modelcontextprotocol/tasks extension get a task back right away, so they can run many in parallel and poll them."
+
 type server struct {
-	b         *backend
-	conn      *jsonrpc.Conn
+	b    *backend
+	conn *jsonrpc.Conn
+	// legacy is set when the client negotiated with initialize, so it gets
+	// plain tool calls and, if it can, elicitation/create for questions.
+	legacy    atomic.Bool
 	canElicit atomic.Bool
 
 	mu    sync.Mutex
 	tasks map[string]*task
+	subs  map[string]*subscription // by the ID of their subscriptions/listen
 }
 
 // task is ax-mcp's cached view of one MCP task. Everything in it can be
@@ -64,8 +68,9 @@ type task struct {
 	message  string
 	updated  time.Time
 	ask      *pendingAsk
-	asking   int // id of the ask an elicitation is in flight for
+	answered int // the last ask this process handed an answer to
 	result   *mcp.CallToolResult
+	err      *mcp.Error
 	changed  chan struct{} // closed and replaced on every change
 	watching bool
 }
@@ -76,27 +81,61 @@ type pendingAsk struct {
 	RequestedSchema map[string]any `json:"requestedSchema"`
 }
 
+// key is the ask's inputRequests key. axmcp numbers a job's asks from 1, so
+// the key is unique over the task's lifetime.
+func (a *pendingAsk) key() string { return "ask-" + strconv.Itoa(a.ID) }
+
+// subscription is an open subscriptions/listen.
+type subscription struct {
+	id      json.RawMessage
+	taskIDs map[string]bool
+	cancel  context.CancelFunc
+}
+
 func newServer(b *backend) *server {
-	return &server{b: b, tasks: map[string]*task{}}
+	return &server{b: b, tasks: map[string]*task{}, subs: map[string]*subscription{}}
 }
 
 func (t *task) snapshot() mcp.Task {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	return t.snapshotLocked()
+}
+
+func (t *task) snapshotLocked() mcp.Task {
 	ttl := t.ttl
 	return mcp.Task{
-		TaskID:        t.id,
-		Status:        t.status,
-		StatusMessage: t.message,
-		CreatedAt:     t.created.UTC().Format(time.RFC3339Nano),
-		LastUpdatedAt: t.updated.UTC().Format(time.RFC3339Nano),
-		TTL:           &ttl,
-		PollInterval:  pollInterval.Milliseconds(),
+		TaskID:         t.id,
+		Status:         t.status,
+		StatusMessage:  t.message,
+		CreatedAt:      t.created.UTC().Format(time.RFC3339Nano),
+		LastUpdatedAt:  t.updated.UTC().Format(time.RFC3339Nano),
+		TTLMs:          &ttl,
+		PollIntervalMs: pollInterval.Milliseconds(),
 	}
 }
 
+// detailed is what tasks/get returns and notifications/tasks carries.
+func (t *task) detailed() mcp.DetailedTask {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	d := mcp.DetailedTask{Task: t.snapshotLocked()}
+	switch t.status {
+	case mcp.StatusInputRequired:
+		d.InputRequests = map[string]mcp.InputRequest{t.ask.key(): {
+			Method: "elicitation/create",
+			Params: mcp.ElicitParams{Mode: "form", Message: t.ask.Message, RequestedSchema: t.ask.RequestedSchema},
+		}}
+	case mcp.StatusCompleted:
+		d.Result = t.result
+	case mcp.StatusFailed:
+		d.Error = t.err
+	}
+	return d
+}
+
 // update applies fn to t and, if the status or message changed, wakes
-// waiters and sends notifications/tasks/status.
+// waiters and notifies listeners.
 func (s *server) update(t *task, fn func(t *task)) {
 	t.mu.Lock()
 	if mcp.Terminal(t.status) {
@@ -107,13 +146,38 @@ func (s *server) update(t *task, fn func(t *task)) {
 	fn(t)
 	changed := t.status+"\x00"+t.message != before
 	if changed {
-		t.updated = time.Now()
+		// createdAt comes from AX's clock; never go before it.
+		t.updated = later(time.Now(), t.created)
 		close(t.changed)
 		t.changed = make(chan struct{})
 	}
 	t.mu.Unlock()
-	if changed && s.conn != nil {
-		s.conn.Notify("notifications/tasks/status", t.snapshot())
+	if changed {
+		s.notify(t, nil)
+	}
+}
+
+// notify sends t's state to sub, or to every listener on t if sub is nil.
+func (s *server) notify(t *task, sub *subscription) {
+	var ids []json.RawMessage
+	if sub != nil {
+		ids = append(ids, sub.id)
+	} else {
+		s.mu.Lock()
+		for _, sub := range s.subs {
+			if sub.taskIDs[t.id] {
+				ids = append(ids, sub.id)
+			}
+		}
+		s.mu.Unlock()
+	}
+	if len(ids) == 0 || s.conn == nil {
+		return
+	}
+	d := t.detailed()
+	for _, id := range ids {
+		d.Meta = map[string]any{mcp.MetaSubscriptionID: id}
+		s.conn.Notify("notifications/tasks", d)
 	}
 }
 
@@ -121,74 +185,126 @@ func (s *server) setStatus(t *task, status, message string) {
 	s.update(t, func(t *task) { t.status, t.message = status, message })
 }
 
-func (s *server) finish(t *task, status, message string, res *mcp.CallToolResult) {
-	s.update(t, func(t *task) { t.status, t.message, t.result, t.ask = status, message, res, nil })
+// complete ends t with a tool result, which may be an error result.
+func (s *server) complete(t *task, message string, res *mcp.CallToolResult) {
+	s.update(t, func(t *task) { t.status, t.message, t.result, t.ask = mcp.StatusCompleted, message, res, nil })
+}
+
+// fail ends t with the JSON-RPC error a plain tools/call would have returned.
+func (s *server) fail(t *task, message string) {
+	s.update(t, func(t *task) {
+		t.status, t.message, t.ask = mcp.StatusFailed, message, nil
+		t.err = &mcp.Error{Code: jsonrpc.CodeInternalError, Message: message}
+	})
+}
+
+func (s *server) cancelled(t *task, message string) {
+	s.update(t, func(t *task) { t.status, t.message, t.ask = mcp.StatusCancelled, message, nil })
 }
 
 func (s *server) handle(ctx context.Context, method string, params json.RawMessage) (any, error) {
+	if strings.HasPrefix(method, "notifications/") {
+		if method == "notifications/cancelled" {
+			s.endListen(params)
+		}
+		return nil, nil
+	}
+	var p struct {
+		Meta mcp.RequestMeta `json:"_meta"`
+	}
+	json.Unmarshal(params, &p)
+	if v := p.Meta.ProtocolVersion; v != "" && v != mcp.ProtocolVersion {
+		return nil, &jsonrpc.Error{
+			Code:    mcp.CodeUnsupportedProtocolVersion,
+			Message: "Unsupported protocol version",
+			Data:    map[string]any{"supported": []string{mcp.ProtocolVersion}, "requested": v},
+		}
+	}
+	tasks := p.Meta.ClientCapabilities.Tasks()
+
 	switch method {
 	case "initialize":
-		var p mcp.InitializeParams
-		if err := json.Unmarshal(params, &p); err != nil {
-			return nil, jsonrpc.Errorf(jsonrpc.CodeInvalidParams, "%v", err)
-		}
-		var caps map[string]json.RawMessage
-		json.Unmarshal(p.Capabilities, &caps)
-		_, ok := caps["elicitation"]
-		s.canElicit.Store(ok)
-		slog.Info("client connected", "client", p.ClientInfo.Name, "protocolVersion", p.ProtocolVersion, "elicitation", ok)
-		// Older clients get plain tool calls; tasks need 2025-11-25.
-		version := mcp.ProtocolVersion
-		if p.ProtocolVersion == "2025-06-18" || p.ProtocolVersion == "2025-03-26" {
-			version = p.ProtocolVersion
-		}
-		return mcp.InitializeResult{
-			ProtocolVersion: version,
+		return s.initialize(params)
+	case "server/discover":
+		return mcp.DiscoverResult{
+			ResultType:        mcp.ResultComplete,
+			TTLMs:             time.Hour.Milliseconds(),
+			CacheScope:        "public",
+			SupportedVersions: []string{mcp.ProtocolVersion},
 			Capabilities: map[string]any{
-				"tools": map[string]any{},
-				"tasks": map[string]any{
-					"list":     map[string]any{},
-					"cancel":   map[string]any{},
-					"requests": map[string]any{"tools": map[string]any{"call": map[string]any{}}},
-				},
+				"tools":      map[string]any{},
+				"extensions": map[string]any{mcp.ExtTasks: map[string]any{}},
 			},
-			ServerInfo:   mcp.Implementation{Name: "ax-mcp", Title: "AX tasks over MCP", Version: "0.1.0"},
-			Instructions: "sandbox_run runs code as an AX task, in an isolated sandbox. Call it as a task to run many in parallel and poll them.",
+			Instructions: instructions,
 		}, nil
 	case "ping":
-		return struct{}{}, nil
+		return mcp.EmptyResult{ResultType: mcp.ResultComplete}, nil
 	case "tools/list":
-		return mcp.ListToolsResult{Tools: []mcp.Tool{sandboxRunTool}}, nil
+		return mcp.ListToolsResult{ResultType: mcp.ResultComplete, TTLMs: time.Hour.Milliseconds(), CacheScope: "public", Tools: []mcp.Tool{sandboxRunTool}}, nil
 	case "tools/call":
-		return s.callTool(ctx, params)
-	case "tasks/get":
-		t, err := s.lookupParams(ctx, params)
+		return s.callTool(ctx, params, tasks)
+	case "subscriptions/listen":
+		return s.listen(ctx, params, tasks)
+	case "tasks/get", "tasks/update", "tasks/cancel":
+		if !tasks {
+			return nil, missingTasks()
+		}
+		var tp mcp.TaskIDParams
+		if err := json.Unmarshal(params, &tp); err != nil || tp.TaskID == "" {
+			return nil, jsonrpc.Errorf(jsonrpc.CodeInvalidParams, "taskId is required")
+		}
+		t, err := s.lookup(ctx, tp.TaskID)
 		if err != nil {
 			return nil, err
 		}
-		return t.snapshot(), nil
-	case "tasks/result":
-		t, err := s.lookupParams(ctx, params)
-		if err != nil {
-			return nil, err
+		switch method {
+		case "tasks/get":
+			d := t.detailed()
+			d.ResultType = mcp.ResultComplete
+			return d, nil
+		case "tasks/update":
+			return s.updateTask(ctx, t, params)
+		default:
+			return s.cancel(ctx, t)
 		}
-		return s.awaitResult(ctx, t)
-	case "tasks/list":
-		return s.listTasks(ctx)
-	case "tasks/cancel":
-		t, err := s.lookupParams(ctx, params)
-		if err != nil {
-			return nil, err
-		}
-		return s.cancel(ctx, t)
-	}
-	if strings.HasPrefix(method, "notifications/") {
-		return nil, nil
 	}
 	return nil, jsonrpc.Errorf(jsonrpc.CodeMethodNotFound, "method %q not found", method)
 }
 
-func (s *server) callTool(ctx context.Context, params json.RawMessage) (any, error) {
+func missingTasks() error {
+	return &jsonrpc.Error{
+		Code:    mcp.CodeMissingClientCapability,
+		Message: "Missing required client capability",
+		Data:    map[string]any{"requiredCapabilities": map[string]any{"extensions": map[string]any{mcp.ExtTasks: map[string]any{}}}},
+	}
+}
+
+// initialize serves clients on revisions before 2026-07-28. They get
+// sandbox_run as a plain tool call that returns when the job is done.
+func (s *server) initialize(params json.RawMessage) (any, error) {
+	var p mcp.InitializeParams
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, jsonrpc.Errorf(jsonrpc.CodeInvalidParams, "%v", err)
+	}
+	var caps map[string]json.RawMessage
+	json.Unmarshal(p.Capabilities, &caps)
+	_, ok := caps["elicitation"]
+	s.legacy.Store(true)
+	s.canElicit.Store(ok)
+	slog.Info("client connected", "client", p.ClientInfo.Name, "protocolVersion", p.ProtocolVersion, "elicitation", ok)
+	version := mcp.LegacyProtocolVersion
+	if p.ProtocolVersion == "2025-06-18" || p.ProtocolVersion == "2025-03-26" {
+		version = p.ProtocolVersion
+	}
+	return mcp.InitializeResult{
+		ProtocolVersion: version,
+		Capabilities:    map[string]any{"tools": map[string]any{}},
+		ServerInfo:      mcp.Implementation{Name: "ax-mcp", Title: "AX tasks over MCP", Version: "0.1.0"},
+		Instructions:    instructions,
+	}, nil
+}
+
+func (s *server) callTool(ctx context.Context, params json.RawMessage, asTask bool) (any, error) {
 	var p mcp.CallToolParams
 	if err := json.Unmarshal(params, &p); err != nil {
 		return nil, jsonrpc.Errorf(jsonrpc.CodeInvalidParams, "%v", err)
@@ -206,15 +322,11 @@ func (s *server) callTool(ctx context.Context, params json.RawMessage) (any, err
 	if j.Language != "python" && j.Language != "sh" {
 		return nil, jsonrpc.Errorf(jsonrpc.CodeInvalidParams, "language must be python or sh, not %q", j.Language)
 	}
-	ttl := defaultTTL
-	if p.Task != nil && p.Task.TTL != nil {
-		ttl = min(max(time.Duration(*p.Task.TTL)*time.Millisecond, minTTL), maxTTL)
-	}
 
-	// The AX task exists before the client learns the taskId, so a restart
-	// right after this call cannot lose it.
+	// The AX task exists before the client learns the taskId, so tasks/get
+	// finds it even if this process dies right after replying.
 	id := newTaskID()
-	at, err := s.b.create(ctx, id, j, ttl.Milliseconds())
+	at, err := s.b.create(ctx, id, j, taskTTL.Milliseconds())
 	if err != nil {
 		return nil, fmt.Errorf("creating AX task: %w", err)
 	}
@@ -224,21 +336,18 @@ func (s *server) callTool(ctx context.Context, params json.RawMessage) (any, err
 		rctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 		if err := s.b.resume(rctx, id); err != nil {
-			s.finish(t, mcp.StatusFailed, "starting sandbox failed", errorResult(id, "starting sandbox: "+err.Error()))
+			s.fail(t, "starting sandbox: "+err.Error())
 			return
 		}
 		s.watch(t)
 	}()
-	slog.Info("task created", "task", id, "job", j.Name, "taskAugmented", p.Task != nil)
+	slog.Info("task created", "task", id, "job", j.Name, "asTask", asTask)
 
-	if p.Task == nil {
-		// A plain tools/call: same task, but the caller waits for it.
-		return s.awaitResult(ctx, t)
+	if !asTask {
+		// The client can't take a task: same task, but the caller waits for it.
+		return s.awaitResult(ctx, t, s.legacy.Load() && s.canElicit.Load())
 	}
-	return mcp.CreateTaskResult{
-		Task: t.snapshot(),
-		Meta: map[string]any{mcp.MetaImmediateResponse: fmt.Sprintf("Started sandbox %s on AX; it keeps running in the background.", id)},
-	}, nil
+	return mcp.CreateTaskResult{ResultType: mcp.ResultTask, Task: t.snapshot()}, nil
 }
 
 // adopt returns the cached task for an AX task, creating it if needed.
@@ -255,19 +364,11 @@ func (s *server) adopt(at *v1alpha1.Task) *task {
 		created: at.GetMetadata().GetCreateTime().AsTime(),
 		ttl:     ttl,
 		status:  mcp.StatusWorking,
-		updated: at.GetMetadata().GetUpdateTime().AsTime(),
+		updated: later(at.GetMetadata().GetUpdateTime().AsTime(), at.GetMetadata().GetCreateTime().AsTime()),
 		changed: make(chan struct{}),
 	}
 	s.tasks[id] = t
 	return t
-}
-
-func (s *server) lookupParams(ctx context.Context, params json.RawMessage) (*task, error) {
-	var p mcp.TaskIDParams
-	if err := json.Unmarshal(params, &p); err != nil || p.TaskID == "" {
-		return nil, jsonrpc.Errorf(jsonrpc.CodeInvalidParams, "taskId is required")
-	}
-	return s.lookup(ctx, p.TaskID)
 }
 
 // lookup finds a task, asking AX about tasks this process has not seen,
@@ -280,8 +381,8 @@ func (s *server) lookup(ctx context.Context, id string) (*task, error) {
 		return t, nil
 	}
 	at, err := s.b.get(ctx, id)
-	if status.Code(err) == codes.NotFound {
-		return nil, jsonrpc.Errorf(jsonrpc.CodeInvalidParams, "unknown task %q", id)
+	if status.Code(err) == codes.NotFound || (err == nil && at.GetMetadata().GetLabels()[labelOwner] != s.b.owner) {
+		return nil, jsonrpc.Errorf(jsonrpc.CodeInvalidParams, "Failed to retrieve task: task %q not found", id)
 	}
 	if err != nil {
 		return nil, err
@@ -322,7 +423,7 @@ func (s *server) refresh(ctx context.Context, t *task, at *v1alpha1.Task) {
 		at, err = s.b.get(ctx, t.id)
 	}
 	if status.Code(err) == codes.NotFound {
-		s.finish(t, mcp.StatusFailed, "the AX task was deleted", errorResult(t.id, "the AX task was deleted"))
+		s.fail(t, "the AX task was deleted")
 		return
 	}
 	if err != nil {
@@ -345,7 +446,7 @@ func (s *server) refresh(ctx context.Context, t *task, at *v1alpha1.Task) {
 				msg += ": " + c.GetMessage()
 			}
 		}
-		s.finish(t, mcp.StatusFailed, msg, errorResult(t.id, msg))
+		s.fail(t, msg)
 	case v1alpha1.TaskState_TASK_STATE_SUSPENDING, v1alpha1.TaskState_TASK_STATE_SUSPENDED:
 		s.setStatus(t, mcp.StatusWorking, "sandbox is suspended in AX (`ax resume task "+t.id+"` to continue)")
 	default:
@@ -355,24 +456,36 @@ func (s *server) refresh(ctx context.Context, t *task, at *v1alpha1.Task) {
 
 func (s *server) applyProbe(t *task, p *probe) {
 	switch {
-	case p.Cancelled && p.Exit == nil:
-		// The job got SIGTERM and may be writing its result on the way out.
-		s.setStatus(t, mcp.StatusWorking, "stopping")
-	case p.Cancelled:
-		s.finish(t, mcp.StatusCancelled, "cancelled", jobResult(t.id, p, -1, true))
+	case p.Exit != nil && p.Cancelled:
+		// A cancelled task carries no result, so what the job wrote on its
+		// way out becomes the status message.
+		s.cancelled(t, cmp.Or(strings.TrimSpace(jobText(p)), "cancelled"))
 	case p.Exit != nil:
 		code, _ := strconv.Atoi(strings.TrimSpace(*p.Exit))
 		if code == 0 {
-			s.finish(t, mcp.StatusCompleted, "exited 0", jobResult(t.id, p, code, false))
+			s.complete(t, "exited 0", jobResult(t.id, p, code, false))
 		} else {
-			s.finish(t, mcp.StatusFailed, fmt.Sprintf("exited with code %d", code), jobResult(t.id, p, code, true))
+			// The tool ran and reports an error: that is a completed task
+			// whose result has isError, not a failed one.
+			s.complete(t, fmt.Sprintf("exited with code %d", code), jobResult(t.id, p, code, true))
 		}
+	case p.CancelReq || p.Cancelled:
+		// The job got (or is about to get) SIGTERM and may be writing its
+		// result on the way out.
+		s.setStatus(t, mcp.StatusWorking, "stopping")
 	case p.Ask != nil:
 		var a pendingAsk
 		if err := json.Unmarshal([]byte(*p.Ask), &a); err != nil {
 			return // partially written; next poll
 		}
-		s.update(t, func(t *task) { t.status, t.message, t.ask = mcp.StatusInputRequired, a.Message, &a })
+		s.update(t, func(t *task) {
+			if a.ID <= t.answered || (p.Answered != nil && *p.Answered == a.ID) {
+				// Answered; the job hasn't picked it up yet.
+				t.status, t.ask = mcp.StatusWorking, nil
+				return
+			}
+			t.status, t.message, t.ask = mcp.StatusInputRequired, a.Message, &a
+		})
 	default:
 		msg := "running"
 		if p.Status != nil && strings.TrimSpace(*p.Status) != "" {
@@ -382,65 +495,40 @@ func (s *server) applyProbe(t *task, p *probe) {
 	}
 }
 
-// awaitResult blocks until t is terminal and returns its tool result. While it
-// waits it delivers the task's questions to the client as elicitation/create
-// requests, which is how the tasks utility carries input_required.
-func (s *server) awaitResult(ctx context.Context, t *task) (*mcp.CallToolResult, error) {
-	for {
-		t.mu.Lock()
-		if mcp.Terminal(t.status) {
-			res := *t.result
-			t.mu.Unlock()
-			res.Meta = mcp.RelatedTask(t.id)
-			return &res, nil
-		}
-		ch := t.changed
-		var ask *pendingAsk
-		if t.status == mcp.StatusInputRequired && t.ask != nil && t.asking != t.ask.ID {
-			ask = t.ask
-			t.asking = ask.ID
-		}
-		t.mu.Unlock()
-
-		if ask != nil {
-			if err := s.elicit(ctx, t, ask); err != nil {
-				t.mu.Lock()
-				t.asking = 0
-				t.mu.Unlock()
-				if ctx.Err() != nil {
-					return nil, ctx.Err()
-				}
-				slog.Warn("elicitation failed", "task", t.id, "err", err)
-				time.Sleep(pollInterval)
+// updateTask serves tasks/update: an answer to the task's outstanding
+// question goes into its sandbox, where axmcp.ask is waiting for it.
+func (s *server) updateTask(ctx context.Context, t *task, params json.RawMessage) (any, error) {
+	var p mcp.UpdateTaskParams
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, jsonrpc.Errorf(jsonrpc.CodeInvalidParams, "%v", err)
+	}
+	t.mu.Lock()
+	ask := t.ask
+	if t.status != mcp.StatusInputRequired {
+		ask = nil
+	}
+	t.mu.Unlock()
+	// Responses to keys that aren't outstanding are ignored.
+	if ask != nil {
+		if res, ok := p.InputResponses[ask.key()]; ok {
+			if err := s.answer(ctx, t, ask.ID, res); err != nil {
+				return nil, fmt.Errorf("handing the answer to %s: %w", t.id, err)
 			}
-			continue
-		}
-		select {
-		case <-ch:
-		case <-ctx.Done():
-			return nil, ctx.Err()
 		}
 	}
+	return mcp.EmptyResult{ResultType: mcp.ResultComplete}, nil
 }
 
-func (s *server) elicit(ctx context.Context, t *task, ask *pendingAsk) error {
-	res := mcp.ElicitResult{Action: "decline"}
-	if s.canElicit.Load() {
-		err := s.conn.Call(ctx, "elicitation/create", mcp.ElicitParams{
-			Mode:            "form",
-			Message:         ask.Message,
-			RequestedSchema: ask.RequestedSchema,
-			Meta:            mcp.RelatedTask(t.id),
-		}, &res)
-		if err != nil {
-			return err
-		}
-	}
-	// The user has answered; retry handing it over rather than asking again.
+// answer writes the answer to ask askID into the task's sandbox.
+func (s *server) answer(ctx context.Context, t *task, askID int, res mcp.ElicitResult) error {
 	var err error
 	for range 5 {
-		if err = s.b.answer(ctx, t.id, ask.ID, res); err == nil {
-			s.setStatus(t, mcp.StatusWorking, "got an answer ("+res.Action+")")
+		if err = s.b.answer(ctx, t.id, askID, res); err == nil {
+			s.update(t, func(t *task) {
+				t.answered = max(t.answered, askID)
+				t.status, t.message, t.ask = mcp.StatusWorking, "got an answer ("+res.Action+")", nil
+			})
+			slog.Info("answer delivered", "task", t.id, "ask", askID, "action", res.Action)
 			return nil
 		}
 		select {
@@ -452,74 +540,147 @@ func (s *server) elicit(ctx context.Context, t *task, ask *pendingAsk) error {
 	return err
 }
 
-func (s *server) cancel(ctx context.Context, t *task) (mcp.Task, error) {
+// awaitResult blocks until t is terminal and returns what a plain tools/call
+// returns. The job's questions go to the client as elicitation/create if
+// elicit, and are declined otherwise.
+func (s *server) awaitResult(ctx context.Context, t *task, elicit bool) (*mcp.CallToolResult, error) {
+	asked := 0
+	for {
+		t.mu.Lock()
+		st, ch, ask := t.status, t.changed, t.ask
+		res, rpcErr, msg := t.result, t.err, t.message
+		t.mu.Unlock()
+		switch st {
+		case mcp.StatusCompleted:
+			r := *res
+			r.ResultType = mcp.ResultComplete
+			return &r, nil
+		case mcp.StatusFailed:
+			return nil, &jsonrpc.Error{Code: rpcErr.Code, Message: rpcErr.Message}
+		case mcp.StatusCancelled:
+			return nil, jsonrpc.Errorf(jsonrpc.CodeInternalError, "cancelled: %s", msg)
+		case mcp.StatusInputRequired:
+			if ask != nil && ask.ID != asked {
+				asked = ask.ID
+				answer := mcp.ElicitResult{Action: "decline"}
+				if elicit {
+					err := s.conn.Call(ctx, "elicitation/create", mcp.ElicitParams{
+						Mode: "form", Message: ask.Message, RequestedSchema: ask.RequestedSchema,
+					}, &answer)
+					if err != nil {
+						if ctx.Err() != nil {
+							return nil, ctx.Err()
+						}
+						slog.Warn("elicitation failed", "task", t.id, "err", err)
+						answer = mcp.ElicitResult{Action: "cancel"}
+					}
+				}
+				if err := s.answer(ctx, t, ask.ID, answer); err != nil {
+					return nil, err
+				}
+				continue
+			}
+		}
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
+// cancel serves tasks/cancel. It only acknowledges: the job gets SIGTERM, and
+// the task reaches cancelled once it has exited.
+func (s *server) cancel(ctx context.Context, t *task) (any, error) {
+	ack := mcp.EmptyResult{ResultType: mcp.ResultComplete}
 	t.mu.Lock()
 	st := t.status
 	t.mu.Unlock()
 	if mcp.Terminal(st) {
-		return mcp.Task{}, jsonrpc.Errorf(jsonrpc.CodeInvalidParams, "cannot cancel task %s: it is already %s", t.id, st)
+		return ack, nil
 	}
 	at, err := s.b.get(ctx, t.id)
 	if err != nil {
-		return mcp.Task{}, err
+		return nil, err
 	}
 	if at.GetStatus().GetState() != v1alpha1.TaskState_TASK_STATE_RUNNING {
 		if err := s.b.delete(ctx, t.id); err != nil { // nothing to stop yet
-			return mcp.Task{}, fmt.Errorf("cancelling %s: %w", t.id, err)
+			return nil, fmt.Errorf("cancelling %s: %w", t.id, err)
 		}
-		s.finish(t, mcp.StatusCancelled, "cancelled by client", errorResult(t.id, "the task was cancelled"))
-		return t.snapshot(), nil
+		s.cancelled(t, "cancelled before the sandbox started")
+		return ack, nil
 	}
 	if err := s.b.cancel(ctx, t.id); err != nil {
-		return mcp.Task{}, fmt.Errorf("cancelling %s: %w", t.id, err)
+		return nil, fmt.Errorf("cancelling %s: %w", t.id, err)
 	}
-	// Give the job a moment to stop (the wrapper SIGKILLs it 5s after SIGTERM),
-	// so the result carries whatever it wrote on the way out.
-	res := errorResult(t.id, "the task was cancelled")
-	for deadline := time.Now().Add(7 * time.Second); time.Now().Before(deadline); time.Sleep(300 * time.Millisecond) {
-		if p, err := s.b.probe(ctx, t.id); err == nil && p.Exit != nil {
-			res = jobResult(t.id, p, -1, true)
-			break
-		}
-	}
-	s.finish(t, mcp.StatusCancelled, "cancelled by client", res)
-	slog.Info("task cancelled", "task", t.id)
-	return t.snapshot(), nil
+	s.setStatus(t, mcp.StatusWorking, "stopping")
+	slog.Info("cancel requested", "task", t.id)
+	return ack, nil
 }
 
-func (s *server) listTasks(ctx context.Context) (mcp.ListTasksResult, error) {
-	ats, err := s.b.list(ctx)
-	if err != nil {
-		return mcp.ListTasksResult{}, err
+// listen serves subscriptions/listen: notifications/tasks for the requested
+// tasks until the client cancels the request or the server shuts down.
+func (s *server) listen(ctx context.Context, params json.RawMessage, tasks bool) (any, error) {
+	var p mcp.ListenParams
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, jsonrpc.Errorf(jsonrpc.CodeInvalidParams, "%v", err)
 	}
+	if len(p.Notifications.TaskIDs) > 0 && !tasks {
+		return nil, missingTasks()
+	}
+	id := jsonrpc.RequestID(ctx)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	sub := &subscription{id: id, taskIDs: map[string]bool{}, cancel: cancel}
+
+	// Tasks from before a restart are looked up in AX, in parallel.
+	found := make([]*task, len(p.Notifications.TaskIDs))
 	var wg sync.WaitGroup
-	for _, at := range ats {
-		s.mu.Lock()
-		_, known := s.tasks[at.GetMetadata().GetName()]
-		s.mu.Unlock()
-		if known {
-			continue
-		}
-		t := s.adopt(at)
-		wg.Go(func() {
-			s.refresh(ctx, t, at)
-			go s.watch(t)
-		})
+	for i, tid := range p.Notifications.TaskIDs {
+		wg.Go(func() { found[i], _ = s.lookup(ctx, tid) })
 	}
 	wg.Wait()
-
+	acked := []string{}
+	for _, t := range found {
+		if t != nil && !sub.taskIDs[t.id] {
+			sub.taskIDs[t.id] = true
+			acked = append(acked, t.id)
+		}
+	}
+	meta := map[string]any{mcp.MetaSubscriptionID: id}
+	s.conn.Notify("notifications/subscriptions/acknowledged", mcp.ListenAck{Meta: meta, Notifications: mcp.SubscriptionFilter{TaskIDs: acked}})
 	s.mu.Lock()
-	all := make([]*task, 0, len(s.tasks))
-	for _, t := range s.tasks {
-		all = append(all, t)
-	}
+	s.subs[string(id)] = sub
 	s.mu.Unlock()
-	slices.SortFunc(all, func(a, b *task) int { return a.created.Compare(b.created) })
-	out := mcp.ListTasksResult{Tasks: []mcp.Task{}}
-	for _, t := range all {
-		out.Tasks = append(out.Tasks, t.snapshot())
+	slog.Info("listening", "subscription", string(id), "tasks", len(acked))
+	// Start the listener off with where each task is now.
+	for _, t := range found {
+		if t != nil {
+			s.notify(t, sub)
+		}
 	}
-	return out, nil
+
+	<-ctx.Done()
+	s.mu.Lock()
+	delete(s.subs, string(id))
+	s.mu.Unlock()
+	return mcp.EmptyResult{ResultType: mcp.ResultComplete, Meta: meta}, nil
+}
+
+// endListen closes the subscription a notifications/cancelled names.
+func (s *server) endListen(params json.RawMessage) {
+	var p struct {
+		RequestID json.RawMessage `json:"requestId"`
+	}
+	if json.Unmarshal(params, &p) != nil {
+		return
+	}
+	s.mu.Lock()
+	sub := s.subs[string(p.RequestID)]
+	s.mu.Unlock()
+	if sub != nil {
+		sub.cancel()
+	}
 }
 
 // reap deletes AX tasks whose MCP task has outlived its TTL.
@@ -550,26 +711,23 @@ func (s *server) reap(ctx context.Context) {
 	}
 }
 
-func jobResult(id string, p *probe, exitCode int, isError bool) *mcp.CallToolResult {
-	text, stdout := deref(p.Output), deref(p.Stdout)
-	if strings.TrimSpace(text) == "" {
-		text = stdout
+// jobText is what the job reported: its axmcp.result, else its stdout.
+func jobText(p *probe) string {
+	if text := deref(p.Output); strings.TrimSpace(text) != "" {
+		return text
 	}
+	return deref(p.Stdout)
+}
+
+func jobResult(id string, p *probe, exitCode int, isError bool) *mcp.CallToolResult {
+	text := jobText(p)
 	if strings.TrimSpace(text) == "" {
 		text = "(no output)"
 	}
 	return &mcp.CallToolResult{
 		Content:           []mcp.Content{{Type: "text", Text: text}},
-		StructuredContent: map[string]any{"sandbox": id, "exitCode": exitCode, "stdout": stdout},
+		StructuredContent: map[string]any{"sandbox": id, "exitCode": exitCode, "stdout": deref(p.Stdout)},
 		IsError:           isError,
-	}
-}
-
-func errorResult(id, msg string) *mcp.CallToolResult {
-	return &mcp.CallToolResult{
-		Content:           []mcp.Content{{Type: "text", Text: msg}},
-		StructuredContent: map[string]any{"sandbox": id},
-		IsError:           true,
 	}
 }
 
@@ -578,4 +736,12 @@ func deref(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+
+func later(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
 }

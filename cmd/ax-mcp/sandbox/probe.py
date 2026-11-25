@@ -13,13 +13,23 @@ def read(path, tail=None):
         return None
 
 
+def answered():
+    # The id of an answer the job hasn't picked up yet.
+    try:
+        return json.loads(read(d + "/answer.json") or "null")["id"]
+    except (ValueError, TypeError, KeyError):
+        return None
+
+
 st = {
     "status": read(d + "/status"),
     "ask": read(d + "/ask.json"),
+    "answered": answered(),
     "exit": read(d + "/exit"),
-    "cancelled": os.path.exists(d + "/cancel") or os.path.exists(d + "/cancelled"),
+    "cancelRequested": os.path.exists(d + "/cancel"),
+    "cancelled": os.path.exists(d + "/cancelled"),  # the job got SIGTERM
 }
-if st["exit"] is not None or st["cancelled"]:
+if st["exit"] is not None:
     st["output"] = read(os.environ.get("AX_OUTPUT_FILE") or os.path.join(ws, ".ax", "output"), 65536)
     st["stdout"] = read(d + "/stdout", 65536)
 print(json.dumps(st))
