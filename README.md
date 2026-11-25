@@ -40,7 +40,7 @@ The demo client (`cmd/ax-mcp-demo`) starts `ax-mcp` over stdio and:
    standard-library Python on seeded synthetic data:
    - **profile**: loads 1.5M orders into SQLite, profiles every column, and finds the change point
      behind the dip (APAC app orders −60% from Aug 14), streaming progress as `statusMessage`
-   - **churn**: trains a logistic regression churn model on 200k customers and reports validation AUC
+   - **retention**: trains a logistic regression churn model on 200k customers and reports validation AUC
      per epoch, then writes `churn_scores.csv`
    - **forecast**: finds 37 huge bulk orders and asks the user from inside the sandbox whether to
      drop, clip or keep them (`input_required`). The client calls `tasks/result`, the server sends a

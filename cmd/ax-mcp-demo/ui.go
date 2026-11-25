@@ -221,7 +221,7 @@ func (m model) View() tea.View {
 // the spinner frame for working tasks; width 0 means don't truncate.
 func renderBoard(s snapshot, spin string, width int, events bool) string {
 	var b strings.Builder
-	b.WriteString(faint.Render(fmt.Sprintf("  %-14s %-8s %-16s %s", "TASK", "JOB", "STATUS", "STATUS MESSAGE")) + "\n")
+	b.WriteString(faint.Render(fmt.Sprintf("  %-14s %-9s %-16s %s", "TASK", "JOB", "STATUS", "STATUS MESSAGE")) + "\n")
 	for _, r := range s.rows {
 		icon, style := statusIcon(r.status)
 		if r.status == mcp.StatusWorking && spin != "" {
@@ -231,7 +231,7 @@ func renderBoard(s snapshot, spin string, width int, events bool) string {
 		if width > 0 {
 			msg = ansi.Truncate(msg, max(10, width-45), "…")
 		}
-		fmt.Fprintf(&b, "  %s %-8s %s %s %s\n", cyan.Render(fmt.Sprintf("%-14s", r.id)), r.job, icon, style.Render(fmt.Sprintf("%-14s", r.status)), msg)
+		fmt.Fprintf(&b, "  %s %-9s %s %s %s\n", cyan.Render(fmt.Sprintf("%-14s", r.id)), r.job, icon, style.Render(fmt.Sprintf("%-14s", r.status)), msg)
 	}
 	b.WriteString("\n" + faint.Render(fmt.Sprintf("  notifications/tasks/status: %d   tasks/get: %d   server restarts: %d", s.notifs, s.polls, s.restarts)) + "\n")
 	if events {

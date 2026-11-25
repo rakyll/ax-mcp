@@ -37,7 +37,7 @@ var jobFiles embed.FS
 
 var jobs = []struct{ name, file, lang string }{
 	{"profile", "jobs/profile.py", "python"},
-	{"churn", "jobs/churn.py", "python"},
+	{"retention", "jobs/retention.py", "python"},
 	{"forecast", "jobs/forecast.py", "python"},
 	{"tune", "jobs/tune.py", "python"},
 	{"etl", "jobs/etl.py", "python"},
@@ -152,7 +152,7 @@ func (d *demo) run(ctx context.Context) error {
 		if err := d.sess().conn.Call(ctx, "tools/call", params, &res); err != nil {
 			return fmt.Errorf("tools/call %s: %w", j.name, err)
 		}
-		d.print(frame("→", "tools/call sandbox_run {name: %-10s task: {ttl: %d}}", strconv.Quote(j.name)+",", ttl) + "\n" +
+		d.print(frame("→", "tools/call sandbox_run {name: %-12s task: {ttl: %d}}", strconv.Quote(j.name)+",", ttl) + "\n" +
 			frame("←", "task %s %s %s", cyan.Render(res.Task.TaskID), res.Task.Status, faint.Render("("+time.Since(t0).Round(time.Millisecond).String()+")")))
 		d.add(&row{id: res.Task.TaskID, job: j.name, status: res.Task.Status, message: res.Task.StatusMessage})
 	}
@@ -172,7 +172,7 @@ func (d *demo) run(ctx context.Context) error {
 	for _, r := range d.rows {
 		var res mcp.CallToolResult
 		if err := d.sess().conn.Call(ctx, "tasks/result", mcp.TaskIDParams{TaskID: r.id}, &res); err != nil {
-			d.print(fmt.Sprintf("  %s %v", bold.Render(fmt.Sprintf("%-9s", r.job)), err))
+			d.print(fmt.Sprintf("  %s %v", bold.Render(fmt.Sprintf("%-10s", r.job)), err))
 			continue
 		}
 		icon, style := statusIcon(r.status)
@@ -183,9 +183,9 @@ func (d *demo) run(ctx context.Context) error {
 		var b strings.Builder
 		for i, line := range resultLines(res, 5) {
 			if i == 0 {
-				fmt.Fprintf(&b, "  %s %s", style.Render(icon), bold.Render(fmt.Sprintf("%-9s", r.job)))
+				fmt.Fprintf(&b, "  %s %s", style.Render(icon), bold.Render(fmt.Sprintf("%-10s", r.job)))
 			} else {
-				b.WriteString("\n             ")
+				b.WriteString("\n              ")
 			}
 			b.WriteString(text.Render(line))
 		}

@@ -1,4 +1,4 @@
-# Grid-search hyperparameters for the churn model: 2,160 trials, each one a
+# Grid-search hyperparameters for the retention model: 2,160 trials, each one a
 # 5-fold cross-validated training run. In pure Python that takes hours, which
 # is the point: the agent sees the ETA in statusMessage and cancels the task.
 # On SIGTERM the job reports the best trial so far as its result.
