@@ -52,7 +52,7 @@ var (
 	serverPath = flag.String("server", "", "ax-mcp binary (default: next to this binary, then $PATH)")
 	auto       = flag.Bool("auto", false, "answer elicitations without asking (also when stdin is not a terminal)")
 	noRestart  = flag.Bool("no-restart", false, "skip killing and restarting ax-mcp")
-	keep       = flag.Bool("keep", false, "keep the AX sandboxes when the demo ends (ax-mcp deletes them after their TTL)")
+	keep       = flag.Bool("keep", false, "keep the AX tasks when the demo ends (ax-mcp deletes them after their TTL)")
 	tracePath  = flag.String("trace", "", "write every JSON-RPC frame to this file")
 )
 
@@ -116,7 +116,7 @@ func main() {
 func (d *demo) run(ctx context.Context) error {
 	d.print("\n" + banner.Render(" AX × MCP Tasks ") + "\n" +
 		faint.Render(`  A data science agent asked "why did Q3 revenue dip, and what's next?" fans out its analysis.`) + "\n" +
-		faint.Render("  Every tool call below runs as an MCP task backed by a sandbox on AX.") + "\n" +
+		faint.Render("  Every tool call below runs as an MCP task backed by an AX task.") + "\n" +
 		faint.Render("  server log: "+d.logPath))
 
 	d.print(step("1", "initialize", "the server advertises the tasks capability"))
@@ -203,7 +203,7 @@ func (d *demo) run(ctx context.Context) error {
 func (d *demo) cleanup() {
 	d.print(step("6", "clean up", ""))
 	if *keep {
-		d.print("  Kept the sandboxes: " + bold.Render("ax get tasks") + ". ax-mcp deletes them when their TTL runs out.\n")
+		d.print("  Kept the AX tasks: " + bold.Render("ax get tasks") + ". ax-mcp deletes them when their TTL runs out.\n")
 		return
 	}
 	var lines []string

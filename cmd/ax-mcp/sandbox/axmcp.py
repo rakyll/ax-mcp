@@ -1,4 +1,4 @@
-"""axmcp: talk to the MCP client from inside an AX sandbox.
+"""axmcp: talk to the MCP client from inside an AX task.
 
 ax-mcp puts this module on PYTHONPATH of every job. It reads and writes small
 files under $AX_WORKSPACE/.ax/mcp, which ax-mcp polls through `ax ssh`:

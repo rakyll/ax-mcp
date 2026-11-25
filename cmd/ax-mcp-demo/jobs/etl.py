@@ -4,10 +4,10 @@
 import csv, random
 import axmcp
 
-BAD = {318_204, 402_117}
+BAD = {104_211, 131_877}
 
 
-def write_export(path, rows=500_000):
+def write_export(path, rows=165_000):
     rng = random.Random(9)
     with open(path, "w", newline="") as f:
         out = csv.writer(f)

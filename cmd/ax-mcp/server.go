@@ -28,7 +28,7 @@ const (
 
 var sandboxRunTool = mcp.Tool{
 	Name:  "sandbox_run",
-	Title: "Run code in an AX sandbox",
+	Title: "Run code as an AX task",
 	Description: "Run a Python or shell program in a fresh sandbox on AX, with no network access, and return its output. " +
 		"Python programs can `import axmcp` to report progress (axmcp.status), ask the user a question (axmcp.ask) and set the result (axmcp.result).",
 	InputSchema: map[string]any{
@@ -152,8 +152,8 @@ func (s *server) handle(ctx context.Context, method string, params json.RawMessa
 					"requests": map[string]any{"tools": map[string]any{"call": map[string]any{}}},
 				},
 			},
-			ServerInfo:   mcp.Implementation{Name: "ax-mcp", Title: "AX sandboxes as MCP tasks", Version: "0.1.0"},
-			Instructions: "sandbox_run runs code in an isolated AX sandbox. Call it as a task to run many in parallel and poll them.",
+			ServerInfo:   mcp.Implementation{Name: "ax-mcp", Title: "AX tasks over MCP", Version: "0.1.0"},
+			Instructions: "sandbox_run runs code as an AX task, in an isolated sandbox. Call it as a task to run many in parallel and poll them.",
 		}, nil
 	case "ping":
 		return struct{}{}, nil
