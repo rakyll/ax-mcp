@@ -48,14 +48,39 @@ claude mcp add ax-tasks -- $PWD/bin/ax-mcp
 
 ## Writing jobs
 
-Python jobs can `import axmcp`:
+A job is a Python program that ax-mcp runs in its own AX task. It talks to
+the MCP client through the `axmcp` module, which ax-mcp provides:
+
+| Call | MCP effect |
+|---|---|
+| `axmcp.status(message)` | sets the task's `statusMessage` |
+| `axmcp.ask(message, schema)` | moves the task to `input_required` and asks the user through `elicitation/create`; blocks until they answer |
+| `axmcp.result(text)` | sets the text of the tool result |
 
 ```python
 import axmcp
-axmcp.status("halfway there")                       # statusMessage
-answer = axmcp.ask("Proceed?", {"type": "object",
-    "properties": {"ok": {"type": "boolean"}}})      # input_required → elicitation
-axmcp.result("done")                                # the tool result
+
+for i in range(1, 11):
+    axmcp.status(f"step {i}/10")
+
+answer = axmcp.ask(
+    "Found 3 duplicate rows. Drop them?",
+    {
+        "type": "object",
+        "properties": {"drop": {"type": "boolean", "title": "Drop duplicates"}},
+        "required": ["drop"],
+    },
+)
+if answer["action"] == "accept" and answer["content"]["drop"]:
+    ...
+
+axmcp.result("loaded 997 rows")
 ```
 
-Without `axmcp.result`, the result is the job's stdout.
+`axmcp.ask` returns the elicitation result: `action` is `accept`, `decline`
+or `cancel`, and `content` holds the answers when it is `accept`.
+
+If a job never calls `axmcp.result`, its stdout becomes the result. A non-zero
+exit makes the result an error. On `tasks/cancel` the job gets SIGTERM, then
+SIGKILL 5 seconds later. A job can catch SIGTERM and call `axmcp.result` to
+return partial work.
